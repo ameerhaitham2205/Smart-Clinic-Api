@@ -8,6 +8,9 @@ import random
 from dotenv import load_dotenv
 from google import genai
 from datetime import date
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -57,6 +60,12 @@ def startup_event():
         )
     ''')
     
+    # التأكد من إضافة عمود الإيميل إذا الجدول موجود مسبقاً
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
+    except:
+        pass
+
     # بناء جدول تفاصيل الأطباء
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS doctors_info (
@@ -93,6 +102,14 @@ def startup_event():
             status TEXT
         )
     ''')
+
+    # 🟢 تم التحديث: بناء جدول رموز الإيميل المؤقتة
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS email_otps (
+            email TEXT PRIMARY KEY,
+            otp TEXT
+        )
+    ''')
     
     # إضافة حسابك (الأدمن) تلقائياً إذا ما كان موجود
     cursor.execute("SELECT id FROM users WHERE phone = '078405827151'")
@@ -111,18 +128,25 @@ def startup_event():
 # ==========================================
 # النماذج (Models)
 # ==========================================
-class PatientOTPRequest(BaseModel):
-    phone: str
+# 🟢 تم التحديث: نماذج تسجيل ودخول المرضى بالإيميل
+class RequestEmailOTP(BaseModel):
+    email: str
 
-class PatientVerifyRequest(BaseModel):
+class PatientRegisterRequest(BaseModel):
+    full_name: str
+    email: str
+    password: str
     phone: str
-    otp: str
+    otp: str  # إجباري للتأكد من ملكية الإيميل
+
+class PatientLoginRequest(BaseModel):
+    email: str
+    password: str
 
 class StaffLoginRequest(BaseModel):
     staff_id: str  
     password: str
 
-# 🟢 تم التحديث: إضافة المحافظة والعنوان والصورة للأدمن
 class CreateStaffRequest(BaseModel):
     full_name: str
     phone: str              
@@ -156,48 +180,112 @@ class UpdateStatusRequest(BaseModel):
 
 
 # ==========================================
-# 1. نظام دخول المرضى (OTP)
+# 1. نظام دخول المرضى (الإيميل وكلمة السر)
 # ==========================================
-@app.post("/auth/patient/request_otp")
-async def request_otp(request: PatientOTPRequest):
+# 🟢 تم التحديث: دالة إرسال الرمز للإيميل
+@app.post("/auth/patient/send_email_otp")
+async def send_email_otp(request: RequestEmailOTP):
     try:
-        generated_otp = str(random.randint(1000, 9999))
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE phone = %s AND role = 'patient'", (request.phone,))
-        user = cursor.fetchone()
         
-        if user:
-            cursor.execute("UPDATE users SET otp = %s WHERE phone = %s", (generated_otp, request.phone))
-        else:
-            cursor.execute("INSERT INTO users (full_name, phone, otp, role) VALUES (%s, %s, %s, 'patient')", ("مريض جديد", request.phone, generated_otp))
+        # فحص إذا الإيميل مسجل مسبقاً
+        cursor.execute("SELECT id FROM users WHERE email = %s", (request.email,))
+        if cursor.fetchone():
+            conn.close()
+            return {"success": False, "detail": "هذا البريد مسجل مسبقاً!"}
+            
+        generated_otp = str(random.randint(1000, 9999))
+        
+        # حفظ الرمز بالداتابيس
+        cursor.execute('''
+            INSERT INTO email_otps (email, otp) VALUES (%s, %s)
+            ON CONFLICT (email) DO UPDATE SET otp = EXCLUDED.otp
+        ''', (request.email, generated_otp))
+        conn.commit()
+        conn.close()
+
+        # ⚠️ تنبيه: اكتب إيميلك وكلمة سر التطبيقات هنا ⚠️
+        sender_email = os.getenv("SENDER_EMAIL")
+        sender_password = os.getenv("SENDER_PASSWORD")
+        
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = request.email
+        msg['Subject'] = "رمز التحقق من عيادة SmartClinic"
+        
+        body = f"مرحباً بك!\n\nرمز التحقق الخاص بإنشاء حسابك هو: {generated_otp}\n\nيرجى عدم مشاركة الرمز مع أي شخص."
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # إرسال الإيميل
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+        server.quit()
+        
+        return {"success": True, "message": "تم إرسال رمز التحقق إلى بريدك"}
+    except Exception as e:
+        print("خطأ في إرسال الإيميل:", e)
+        raise HTTPException(status_code=500, detail="فشل في إرسال البريد الإلكتروني")
+
+# 🟢 تم التحديث: دالة التسجيل النهائية (بعد التأكد من الرمز)
+@app.post("/auth/patient/register")
+async def patient_register(request: PatientRegisterRequest):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. فحص هل الرمز صحيح؟
+        cursor.execute("SELECT otp FROM email_otps WHERE email = %s", (request.email,))
+        record = cursor.fetchone()
+        
+        if not record or record['otp'] != request.otp:
+            conn.close()
+            return {"success": False, "detail": "رمز التحقق غير صحيح أو منتهي الصلاحية"}
+            
+        # 2. إنشاء الحساب
+        cursor.execute('''
+            INSERT INTO users (full_name, email, password, phone, role) 
+            VALUES (%s, %s, %s, %s, 'patient')
+        ''', (request.full_name, request.email, request.password, request.phone))
+        
+        # 3. مسح الرمز بعد نجاح التسجيل
+        cursor.execute("DELETE FROM email_otps WHERE email = %s", (request.email,))
         
         conn.commit()
         conn.close()
-        print(f"📱 [رسالة واتساب وهمية] الرمز: {generated_otp}")
-        return {"success": True, "message": "تم إرسال رمز التحقق"}
+        return {"success": True, "message": "تم إنشاء الحساب بنجاح"}
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500)
+        print("خطأ في التسجيل:", e)
+        raise HTTPException(status_code=500, detail="حدث خطأ في السيرفر")
 
-@app.post("/auth/patient/verify_otp")
-async def verify_otp(request: PatientVerifyRequest):
+
+@app.post("/auth/patient/login")
+async def patient_login(request: PatientLoginRequest):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id, full_name, phone, role FROM users WHERE phone = %s AND otp = %s AND role = 'patient'", (request.phone, request.otp))
+        
+        cursor.execute("SELECT id, full_name, phone, role FROM users WHERE email = %s AND password = %s AND role = 'patient'", (request.email, request.password))
         user = cursor.fetchone()
+        conn.close()
         
         if user:
-            cursor.execute("UPDATE users SET otp = NULL WHERE phone = %s", (request.phone,))
-            conn.commit()
-            conn.close()
-            return {"success": True, "user": {"id": user['id'], "full_name": user['full_name'], "phone": user['phone'], "role": user['role']}}
-        conn.close()
-        raise HTTPException(status_code=401, detail="الرمز غير صحيح")
+            return {
+                "success": True, 
+                "user": {
+                    "id": user['id'], 
+                    "full_name": user['full_name'], 
+                    "phone": user['phone'], 
+                    "role": user['role']
+                }
+            }
+        
+        return {"success": False, "detail": "البريد الإلكتروني أو كلمة المرور غير صحيحة"}
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500)
+        print("خطأ في الدخول:", e)
+        raise HTTPException(status_code=500, detail="حدث خطأ في السيرفر")
 
 
 # ==========================================
@@ -246,7 +334,6 @@ async def create_staff(request: CreateStaffRequest):
         user_id = cursor.fetchone()['id']
         
         if request.role == 'doctor':
-            # 🟢 تم التحديث: حفظ المحافظة والعنوان عند إضافة الدكتور
             cursor.execute('''
                 INSERT INTO doctors_info (user_id, specialty, price, city, address, image_url) 
                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -356,7 +443,6 @@ async def get_doctors(city: str = "الكل", specialty: str = "الكل", price
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 🟢 تم التحديث: سحب رقم هاتف الطبيب (u.phone as doctor_phone) حتى يشتغل الحجز
         query = '''
             SELECT u.id, u.full_name as name, u.phone as doctor_phone, d.specialty, COALESCE(d.city, 'غير محدد') as city, 
                    COALESCE(d.address, 'غير محدد') as address, d.price as fees, 
