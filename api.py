@@ -14,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 
 load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-DATABASE_URL = "postgresql://postgres.nhdcxefdkcehytaciweq:iGmZDj.42XS&Gnk@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 client = genai.Client(api_key=GOOGLE_API_KEY) if GOOGLE_API_KEY else None
 
