@@ -1,0 +1,8 @@
+flet
+requests
+fastapi
+uvicorn
+psycopg2-binary
+pydantic
+python-dotenv
+google-genai
